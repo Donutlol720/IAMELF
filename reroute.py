@@ -20,6 +20,7 @@ Usage:
   --plateau  also accept equal-cost reroutes (randomised) on alternate passes
   --atoms    also rebuild each puzzle from scratch around hidden-atom candidates
              (atoms.py) and keep the rebuild when it is shorter
+  --beam     with --atoms, also try beam-search rebuilds (slower, usually better)
 """
 import csv
 import ctypes
@@ -466,8 +467,151 @@ def construct(p, old_nodes, old_pos, atom_list, out_buf, use_struct=True):
     return nodes, pos
 
 
+FAR = 6  # estimated cost of a target with no known cheap route
+
+
+def _routes(p, nodes, remaining, atoms_in, out_buf, use_struct):
+    """Cheapest known route (<= 3 via reroute, or structured) for each remaining target."""
+    L = lib()
+    limit = p["limit"]
+    S = list(nodes)
+    Sa = (ctypes.c_uint64 * len(S))(*S)
+    Da = (ctypes.c_uint64 * 1)()
+    out = {}
+    f1 = None
+    for t in remaining:
+        Da[0] = t
+        c = L.reroute(t, Sa, len(S), Da, 1, limit, 3, out_buf)
+        if c > 0:
+            out[t] = [(out_buf[4 * k], OPS[out_buf[4 * k + 1]], out_buf[4 * k + 2], out_buf[4 * k + 3]) for k in range(c)]
+        if use_struct and atoms_in and (t not in out or len(out[t]) >= 3):
+            if f1 is None:
+                f1 = f1_map(nodes, limit)
+            new = structured(p, nodes, f1, atoms_in, t)
+            if new and (t not in out or len(new) < len(out[t])):
+                out[t] = new
+    return out
+
+
+def _lookahead(nodes, new_vals, remaining, est, limit):
+    """Cheap update of per-target estimates after adding new_vals: targets that are
+    now one op away get 1, targets one op from a one-op value of new_vals get <= 2."""
+    est = dict(est)
+    rem = set(remaining)
+    pool = list(nodes)
+    one = set()
+    for n in new_vals:
+        for s in pool:
+            hi, lo = (n, s) if n >= s else (s, n)
+            for v in (n + s, n * s, hi - lo, hi // lo if lo and hi % lo == 0 else 0):
+                if 0 < v <= limit:
+                    one.add(v)
+    for t in rem & one:
+        est[t] = 1
+    small = [s for s in pool if s < 1 << 20]
+    for t in rem:
+        if est.get(t, FAR) <= 2:
+            continue
+        for s in small:
+            if (t - s in one) or (t + s in one) or (s > 1 and t % s == 0 and t // s in one):
+                est[t] = 2
+                break
+    return est
+
+
+def beam_construct(p, old_nodes, old_pos, atom_list, out_buf, width=6, branch=4, use_struct=True):
+    """Beam search over partial DAGs. Each step adds the route of one remaining target;
+    states are ranked by  nodes so far + sum of estimated costs of remaining targets,
+    so routes whose new values also help other targets win."""
+    limit = p["limit"]
+    targets = set(p["targets"])
+    nodes0 = {v: None for v in p["start"]}
+    order0 = []
+    for a in atom_list:
+        if a not in nodes0:
+            new = build_value(p, nodes0, a, out_buf) or deep_build(p, nodes0, a)
+            for val, op, x, y in new or ():
+                if val not in nodes0:
+                    nodes0[val] = (op, x, y)
+                    order0.append(val)
+    atoms_in = [a for a in atom_list if a in nodes0]
+    rem0 = frozenset(t for t in targets if t not in nodes0)
+    r0 = _routes(p, nodes0, rem0, atoms_in, out_buf, use_struct)
+    est0 = {t: len(r0[t]) if t in r0 else FAR for t in rem0}
+    beam = [(0, nodes0, order0, rem0, est0)]
+    done = []
+    while beam:
+        children = {}
+        for g, nodes, order, rem, est in beam:
+            routes = _routes(p, nodes, rem, atoms_in, out_buf, use_struct)
+            moves = sorted(routes.items(), key=lambda kv: len(kv[1]))[:branch]
+            if not moves:
+                # nothing cheap: take one target the greedy way
+                cn, cp = construct_step(p, nodes, rem, old_nodes, old_pos, out_buf)
+                moves = [cn]
+            for item in moves:
+                new = item[1] if isinstance(item, tuple) else item
+                nn = dict(nodes)
+                no = list(order)
+                added = []
+                for val, op, x, y in new:
+                    if val not in nn:
+                        nn[val] = (op, x, y)
+                        no.append(val)
+                        added.append(val)
+                nrem = frozenset(t for t in rem if t not in nn)
+                ng = g + len(added)
+                if not nrem:
+                    done.append((ng, nn, no))
+                    continue
+                key = frozenset(nn)
+                if key in children:
+                    continue
+                nest = _lookahead(nodes, added, nrem, {t: est.get(t, FAR) for t in nrem}, limit)
+                for t, r in routes.items():
+                    if t in nrem:
+                        nest[t] = min(nest[t], len(r))
+                children[key] = (ng + sum(nest.values()), (ng, nn, no, nrem, nest))
+        beam = [s for _, s in sorted(children.values(), key=lambda x: x[0])[:width]]
+    g, nodes, order = min(done, key=lambda d: d[0])
+    pos = {v: -1.0 for v in p["start"]}
+    pos.update({v: float(k) for k, v in enumerate(order)})
+    return nodes, pos
+
+
+def construct_step(p, nodes, rem, old_nodes, old_pos, out_buf):
+    """One greedy fallback route (build_value / deep_build / old ancestry) for some target."""
+    best = None
+    for t in rem:
+        new = build_value(p, nodes, t, out_buf, small=20)
+        if new and (best is None or len(new) < len(best)):
+            best = new
+    if best is None or len(best) > 4:
+        for t in rem:
+            new = deep_build(p, nodes, t)
+            if new and (best is None or len(new) < len(best)):
+                best = new
+
+    def missing(t):
+        need, st, seen = [], [t], set()
+        while st:
+            x = st.pop()
+            if x in nodes or x in seen:
+                continue
+            seen.add(x)
+            need.append(x)
+            st.extend((old_nodes[x][1], old_nodes[x][2]))
+        return need
+    t = min(rem, key=lambda t: len(missing(t)))
+    need = missing(t)
+    if best is None or len(need) < len(best):
+        need.sort(key=lambda x: old_pos[x])
+        best = [(x,) + old_nodes[x] for x in need]
+    return best, None
+
+
 def optimise(args):
-    p, prog, passes, plateau, atoms = args
+    p, prog, passes, plateau, atoms, beam = args
     nodes, pos = parse(p, prog)
     best = schedule(p, nodes, pos)
     if best is None or not run_program(p, best)[0] or len(best) > len(prog):
@@ -479,8 +623,14 @@ def optimise(args):
         cands = detect_atoms(p["targets"])
         if cands:
             r2 = rng or random.Random(1)
-            for k, st in ((len(cands), True), (len(cands), False), (4, True), (4, False)):
-                cn, cp = construct(p, nodes, pos, cands[:k], out_buf, use_struct=st)
+            variants = [("greedy", k, st) for k, st in ((len(cands), True), (len(cands), False), (4, True), (4, False))]
+            if beam:
+                variants += [("beam", w, b, st) for w, b in ((6, 4), (4, 3)) for st in (True, False)]
+            for var in variants:
+                if var[0] == "greedy":
+                    cn, cp = construct(p, nodes, pos, cands[:var[1]], out_buf, use_struct=var[2])
+                else:
+                    cn, cp = beam_construct(p, nodes, pos, cands, out_buf, width=var[1], branch=var[2], use_struct=var[3])
                 for it in range(4):
                     one_pass(p, cn, cp, out_buf, plateau=it % 2 == 1, rng=r2)
                 prog = evaluate(p, cn, cp)
@@ -510,12 +660,13 @@ def main():
     lim = int(a[a.index("--limit") + 1]) if "--limit" in a else None
     plateau = "--plateau" in a
     atoms = "--atoms" in a
+    beam = "--beam" in a
     P = load_puzzles(puzzles_csv)
     with open(in_csv, newline="") as f:
         base = {r["id"]: json.loads(r["program"]) for r in csv.DictReader(f)}
     ids = sorted(base)[:lim] if lim else sorted(base)
     with Pool(workers) as pool:
-        res = pool.map(optimise, [(P[i], base[i], passes, plateau, atoms) for i in ids], chunksize=1)
+        res = pool.map(optimise, [(P[i], base[i], passes, plateau, atoms, beam) for i in ids], chunksize=1)
     out = dict(base)
     for i, prog in zip(ids, res):
         out[i] = prog
